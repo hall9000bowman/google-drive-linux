@@ -1,12 +1,17 @@
 # Google Drive Desktop Agent for Linux 🐧☁️
 
-> A native Google Drive for Desktop client and agent for Linux that mirrors the Windows/Mac experience — featuring on-demand streaming, VFS file caching, system tray integration, file manager sidebar bookmarks, and background syncing.
+> An unofficial, native Google Drive client and agent for Linux, inspired by the official Windows/Mac desktop app — featuring on-demand streaming, VFS file caching, system tray integration, file manager sidebar bookmarks, and background syncing.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux-orange.svg)](#)
 [![Python](https://img.shields.io/badge/Python-3.8+-brightgreen.svg)](#)
 
 [Leia em Português](README.pt.md)
+
+> [!NOTE]
+> **Unofficial project.** This is an independent, community-made tool. It is not affiliated with, endorsed by, or supported by Google. It is built on [rclone](https://rclone.org/).
+>
+> **Beta software. Use at your own risk.** It has been tested on a limited set of setups. Keep important files backed up and please [report issues](https://github.com/hall9000bowman/google-drive-linux/issues).
 
 ---
 
@@ -165,6 +170,12 @@ To completely remove the agent, its systemd service, desktop shortcuts and sideb
 ```
 
 Your configuration, cache and rclone remote are kept. The uninstaller prints the commands to purge them as well.
+
+---
+
+## ™️ Trademarks
+
+Google Drive™ is a trademark of Google LLC. It is used here only to describe what this tool connects to. The application icon is an original design made for this project and is distributed under the same MIT license.
 
 ---
 

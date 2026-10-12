@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=Google Drive
 GenericName=Cloud Storage Client
-Comment=Google Drive for Desktop on Linux
+Comment=Unofficial Google Drive client for Linux
 Exec=google-drive-agent open
 Icon=google-drive
 Terminal=false

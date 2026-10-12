@@ -1,12 +1,17 @@
 # Google Drive Desktop Agent para Linux 🐧☁️
 
-> Um cliente e agente desktop nativo do Google Drive para Linux equivalente à versão oficial para Windows/Mac ("Drive para computador") — com streaming sob demanda, cache de arquivos VFS, indicador na bandeja do sistema (systray), atalhos na barra lateral do gerenciador de arquivos e sincronização em segundo plano.
+> Um cliente e agente desktop nativo e não oficial do Google Drive para Linux, inspirado no aplicativo oficial para Windows/Mac — com streaming sob demanda, cache de arquivos VFS, indicador na bandeja do sistema (systray), atalhos na barra lateral do gerenciador de arquivos e sincronização em segundo plano.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux-orange.svg)](#)
 [![Python](https://img.shields.io/badge/Python-3.8+-brightgreen.svg)](#)
 
 [Read in English](README.md)
+
+> [!NOTE]
+> **Projeto não oficial.** Esta é uma ferramenta independente, feita pela comunidade. Não é afiliada, endossada nem suportada pelo Google. É construída sobre o [rclone](https://rclone.org/).
+>
+> **Software em fase beta. Use por sua conta e risco.** Foi testado em poucas configurações. Mantenha backup dos arquivos importantes e [relate problemas](https://github.com/hall9000bowman/google-drive-linux/issues).
 
 ---
 
@@ -165,6 +170,12 @@ Para remover o agente, o serviço systemd, os atalhos e o favorito da barra late
 ```
 
 Sua configuração, o cache e o remote do rclone são mantidos. O desinstalador mostra os comandos para apagá-los também.
+
+---
+
+## ™️ Marcas Registradas
+
+Google Drive™ é uma marca registrada do Google LLC, usada aqui apenas para descrever o serviço ao qual esta ferramenta se conecta. O ícone do aplicativo é um desenho original criado para este projeto e distribuído sob a mesma licença MIT.
 
 ---
 

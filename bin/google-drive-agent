@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Google Drive Desktop Agent for Linux
-Provides Google Drive for Desktop functionality (on-demand streaming, VFS caching,
+Unofficial Google Drive client (on-demand streaming, VFS caching,
 system tray indicator, file manager integration, and automatic syncing).
 """
 
@@ -740,7 +740,7 @@ def _desktop_quote(arg):
 def install_systemd_service(start=True):
     agent = _agent_path()
     unit_content = f"""[Unit]
-Description=Google Drive for Desktop (VFS Streaming Mount)
+Description=Google Drive VFS streaming mount (unofficial agent)
 Documentation=https://github.com/hall9000bowman/google-drive-linux
 After=network-online.target
 Wants=network-online.target
@@ -759,7 +759,7 @@ WantedBy=default.target
 
     autostart_content = f"""[Desktop Entry]
 Name=Google Drive Agent
-Comment=Google Drive for Desktop Background Agent
+Comment=Unofficial Google Drive background agent
 Exec={_desktop_quote(agent)} tray
 Icon={ICON_PATH}
 Terminal=false

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Google Drive Desktop Agent for Linux — Automated Installer
-# Installs Google Drive for Desktop functionality into the user environment.
+# Installs an unofficial Google Drive client into the user environment.
 # No root/sudo required.
 # ==============================================================================
 
