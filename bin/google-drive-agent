@@ -375,12 +375,21 @@ def run_tray():
     gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk, GLib
 
+    AppIndicator3 = None
     try:
-        gi.require_version("AyatanaAppIndicator3", "0.1")
-        from gi.repository import AyatanaAppIndicator3 as AppIndicator3
-    except Exception:
         gi.require_version("AppIndicator3", "0.1")
         from gi.repository import AppIndicator3
+    except Exception:
+        try:
+            GLib.log_set_handler("libayatana-appindicator", GLib.LogLevelFlags.LEVEL_WARNING, lambda *_: None)
+            gi.require_version("AyatanaAppIndicator3", "0.1")
+            from gi.repository import AyatanaAppIndicator3 as AppIndicator3
+        except Exception:
+            pass
+
+    if AppIndicator3 is None:
+        print("[ERROR] Neither AppIndicator3 nor AyatanaAppIndicator3 is available.", file=sys.stderr)
+        sys.exit(1)
 
     class GoogleDriveTray:
         def __init__(self):
