@@ -1,0 +1,24 @@
+[Desktop Entry]
+Name=Google Drive
+GenericName=Cloud Storage Client
+Comment=Google Drive for Desktop on Linux
+Exec=google-drive-agent open
+Icon=google-drive
+Terminal=false
+Type=Application
+Categories=Network;FileTransfer;Utility;
+StartupNotify=true
+X-GNOME-Autostart-enabled=true
+Actions=OpenWeb;SyncNow;Setup;
+
+[Desktop Action OpenWeb]
+Name=Open Google Drive on Web
+Exec=google-drive-agent open-web
+
+[Desktop Action SyncNow]
+Name=Refresh / Sync Now
+Exec=google-drive-agent refresh
+
+[Desktop Action Setup]
+Name=Account Setup
+Exec=google-drive-agent setup

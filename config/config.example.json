@@ -1,0 +1,16 @@
+{
+  "remote_name": "gdrive",
+  "mount_path": "~/GoogleDrive",
+  "vfs_cache_mode": "full",
+  "vfs_cache_max_size": "50G",
+  "vfs_cache_max_age": "72h",
+  "vfs_read_chunk_size": "32M",
+  "vfs_read_chunk_size_limit": "2G",
+  "buffer_size": "64M",
+  "dir_cache_time": "72h",
+  "poll_interval": "15s",
+  "export_formats": "link.html",
+  "rc_port": 5572,
+  "client_id": "",
+  "client_secret": ""
+}

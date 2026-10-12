@@ -1,0 +1,39 @@
+# Credentials, Auth, Tokens & Secrets
+*.conf
+rclone.conf
+*.token
+*.secret*
+*.cred*
+*.key
+*.pem
+credentials.json
+client_secrets.json
+
+# Local Configuration (only config.example.json is tracked)
+config/config.json
+config.json
+
+# Caches & Runtime files
+*.log
+*.lock
+.cache/
+cache/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment and IDE
+.env
+.env.*
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Mount and Temp Dirs
+GoogleDrive/
+mnt/
+tmp/
