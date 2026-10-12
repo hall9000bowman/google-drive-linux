@@ -33,9 +33,14 @@ cd google-drive-linux
 ./install.sh
 ```
 
+Se o `rclone` não estiver instalado, o instalador baixa a versão mais recente e verifica o checksum SHA-256 e, quando o `gpg` está disponível, a assinatura oficial do rclone antes de instalá-lo em `~/.local/bin`.
+
 ---
 
 ## 🔑 Configuração e Autenticação
+
+> [!IMPORTANT]
+> O client ID compartilhado do rclone para o Google Drive está sendo descontinuado e deixará de funcionar durante 2026. Antes de executar o setup, [crie seu próprio client ID OAuth do Google](https://rclone.org/drive/#making-your-own-client-id) e preencha `client_id` / `client_secret` no arquivo de configuração (veja [Arquivo de Configuração](#%EF%B8%8F-arquivo-de-configuração) abaixo). Isso também garante uma cota de API dedicada, deixando o drive mais rápido.
 
 Após a instalação, conecte sua conta Google executando:
 
@@ -60,8 +65,9 @@ google-drive-agent open
 # Ver status da conexão, tamanho do cache e cota de armazenamento
 google-drive-agent status
 
-# Forçar atualização de cache e sincronizar novidades da nuvem
+# Reler toda a lista de arquivos do Drive em segundo plano (ou apenas uma pasta)
 google-drive-agent refresh
+google-drive-agent refresh "Trabalho/Relatorios"
 
 # Abrir o Google Drive na Web pelo navegador
 google-drive-agent open-web
@@ -74,10 +80,68 @@ google-drive-agent unmount
 google-drive-agent tray
 
 # Gerenciar o serviço systemd em segundo plano
+google-drive-agent service install
+google-drive-agent service remove
 google-drive-agent service status
 google-drive-agent service start
 google-drive-agent service stop
+
+# Adicionar ou remover o atalho na barra lateral do gerenciador de arquivos
+google-drive-agent bookmark add
+google-drive-agent bookmark remove
 ```
+
+Quando o serviço systemd está habilitado, ele é o responsável pela montagem: `mount`, `unmount` e o botão de montar da bandeja iniciam e param o serviço em vez de abrir um segundo processo do rclone.
+
+---
+
+## ⚙️ Arquivo de Configuração
+
+A configuração fica em `~/.config/google-drive-agent/config.json` (ou em `$XDG_CONFIG_HOME`). O arquivo é privado (`0600`) porque pode conter o seu client secret OAuth. As alterações valem a partir da próxima montagem.
+
+```json
+{
+  "remote_name": "gdrive",
+  "mount_path": "~/GoogleDrive",
+  "vfs_cache_mode": "full",
+  "vfs_cache_max_size": "50G",
+  "vfs_cache_max_age": "72h",
+  "vfs_cache_min_free_space": "10G",
+  "vfs_read_chunk_size": "32M",
+  "vfs_read_chunk_size_limit": "2G",
+  "buffer_size": "16M",
+  "drive_chunk_size": "64M",
+  "dir_cache_time": "72h",
+  "poll_interval": "15s",
+  "export_formats": "link.html",
+  "log_level": "NOTICE",
+  "rc_port": 5572,
+  "client_id": "",
+  "client_secret": ""
+}
+```
+
+- **`mount_path`**: Pasta onde o drive virtual é montado (padrão: `~/GoogleDrive`).
+- **`vfs_cache_max_size`**: Espaço máximo em disco para arquivos em cache (ex.: `25G`, `50G`, `100G`).
+- **`vfs_cache_min_free_space`**: Remove arquivos do cache para manter pelo menos esse espaço livre no disco. Use `""` para desativar (necessário em versões muito antigas do rclone).
+- **`buffer_size`**: Leitura antecipada em memória por arquivo aberto. Fica pequeno porque o cache VFS já guarda os dados em disco.
+- **`drive_chunk_size`**: Tamanho dos blocos de upload. Valores maiores aceleram uploads grandes, mas usam essa quantidade de memória por upload simultâneo. Use `""` para o padrão do rclone.
+- **`export_formats`**: Formato dos Documentos Google (`link.html` abre direto no navegador; também é possível usar `docx,xlsx,pptx`).
+- **`log_level`**: Nível de log do rclone: `DEBUG`, `INFO`, `NOTICE` ou `ERROR`.
+- **`rc_port`**: Porta local da API de controle remoto do rclone (usada pelo *Atualizar*). Escuta apenas em `127.0.0.1` e é protegida por senha.
+- **`client_id` / `client_secret`**: Suas próprias credenciais OAuth do Google Cloud. Fortemente recomendado (veja acima).
+
+Valores inválidos ou desconhecidos geram um aviso e são substituídos pelo padrão. Um arquivo com JSON inválido nunca é sobrescrito.
+
+---
+
+## 🩺 Solução de Problemas
+
+- **Visão geral**: `google-drive-agent status`
+- **Logs (serviço systemd)**: `journalctl --user -u google-drive.service`
+- **Logs (montagem manual / bandeja)**: `~/.cache/google-drive-agent/rclone.log`
+- **"Transport endpoint is not connected"**: o rclone foi encerrado inesperadamente. `google-drive-agent mount` limpa a montagem antiga e monta novamente.
+- **O Atualizar diz que as credenciais foram rejeitadas**: o drive foi montado por uma versão anterior. Desmonte e monte novamente.
 
 ---
 
@@ -85,18 +149,22 @@ google-drive-agent service stop
 
 - **Sem Servidores Intermediários**: Toda a comunicação ocorre diretamente entre o seu computador e as APIs oficiais do Google.
 - **Nenhum Rastreamento**: Zero telemetria, análise de uso ou logs enviados para terceiros.
-- **Credenciais Seguras**: As chaves e tokens OAuth são mantidos exclusivamente na sua máquina local (`~/.config/rclone/rclone.conf`).
+- **Credenciais Seguras**: Os tokens OAuth são mantidos localmente pelo rclone (`~/.config/rclone/rclone.conf`). A configuração do agente e as credenciais geradas só podem ser lidas pelo seu usuário.
+- **API Local Protegida**: A API de controle remoto do rclone escuta apenas em `127.0.0.1` e exige uma senha aleatória (guardada em `~/.config/google-drive-agent/rc-auth.json`). Outros usuários locais e sites abertos no navegador não conseguem usá-la para ler seu token ou alterar seus arquivos. A senha é passada ao rclone por variável de ambiente e nunca aparece na lista de processos.
+- **Downloads Verificados**: O instalador confere o download do rclone com os checksums assinados da versão.
 - **Código Aberto**: Código Python e Shell 100% auditável sob licença MIT.
 
 ---
 
 ## 🗑️ Desinstalação
 
-Para desinstalar o agente e remover os atalhos:
+Para remover o agente, o serviço systemd, os atalhos e o favorito da barra lateral:
 
 ```bash
 ./uninstall.sh
 ```
+
+Sua configuração, o cache e o remote do rclone são mantidos. O desinstalador mostra os comandos para apagá-los também.
 
 ---
 

@@ -1,9 +1,0 @@
-[Desktop Entry]
-Name=Google Drive Agent
-Comment=Google Drive for Desktop Background Agent
-Exec=google-drive-agent tray
-Icon=google-drive
-Terminal=false
-Type=Application
-Categories=Utility;Network;
-X-GNOME-Autostart-enabled=true

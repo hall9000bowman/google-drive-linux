@@ -18,42 +18,51 @@ echo -e "${BOLD}======================================================${RESET}"
 echo -e "${BOLD}   Google Drive Desktop Agent — Uninstaller           ${RESET}"
 echo -e "${BOLD}======================================================${RESET}\n"
 
-# Stop service and unmount
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl --user stop google-drive.service 2>/dev/null || true
-    systemctl --user disable google-drive.service 2>/dev/null || true
+AGENT="${HOME}/.local/bin/google-drive-agent"
+CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+
+if [ -x "${AGENT}" ]; then
+    # The agent knows the configured mount path and XDG locations.
+    "${AGENT}" service remove || true
+    "${AGENT}" unmount || true
+    "${AGENT}" bookmark remove || true
+else
+    # Fallback for a partially removed install: default locations only.
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user disable --now google-drive.service 2>/dev/null || true
+    fi
+    if command -v fusermount3 >/dev/null 2>&1; then
+        fusermount3 -u "${HOME}/GoogleDrive" 2>/dev/null || true
+    elif command -v fusermount >/dev/null 2>&1; then
+        fusermount -u "${HOME}/GoogleDrive" 2>/dev/null || true
+    fi
+    GTK_BM="${CONFIG_HOME}/gtk-3.0/bookmarks"
+    if [ -f "${GTK_BM}" ]; then
+        # Remove only our exact entry, not every line mentioning "GoogleDrive".
+        grep -vxF "file://${HOME}/GoogleDrive Google Drive" "${GTK_BM}" > "${GTK_BM}.tmp" || true
+        cat "${GTK_BM}.tmp" > "${GTK_BM}" && rm -f "${GTK_BM}.tmp"
+    fi
 fi
 
-if command -v fusermount3 >/dev/null 2>&1; then
-    fusermount3 -u "${HOME}/GoogleDrive" 2>/dev/null || true
-elif command -v fusermount >/dev/null 2>&1; then
-    fusermount -u "${HOME}/GoogleDrive" 2>/dev/null || true
-fi
-
-# Remove systemd service
-rm -f "${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user/google-drive.service"
+# Remove systemd service and autostart entry (no-op if already removed above)
+rm -f "${CONFIG_HOME}/systemd/user/google-drive.service"
+rm -f "${CONFIG_HOME}/autostart/google-drive-agent.desktop"
 if command -v systemctl >/dev/null 2>&1; then
     systemctl --user daemon-reload 2>/dev/null || true
 fi
 
 # Remove desktop entries
 rm -f "${XDG_DATA_HOME:-${HOME}/.local/share}/applications/google-drive.desktop"
-rm -f "${XDG_CONFIG_HOME:-${HOME}/.config}/autostart/google-drive-agent.desktop"
 
 # Remove icons
-rm -rf "${XDG_CONFIG_HOME:-${HOME}/.config}/google-drive-agent/icons"
+rm -rf "${CONFIG_HOME}/google-drive-agent/icons"
 rm -f "${XDG_DATA_HOME:-${HOME}/.local/share}/icons/hicolor/128x128/apps/google-drive.png"
 rm -f "${XDG_DATA_HOME:-${HOME}/.local/share}/icons/hicolor/scalable/apps/google-drive.svg"
 
 # Remove binary
-rm -f "${HOME}/.local/bin/google-drive-agent"
-
-# Remove GTK bookmark
-GTK_BM="${XDG_CONFIG_HOME:-${HOME}/.config}/gtk-3.0/bookmarks"
-if [ -f "${GTK_BM}" ]; then
-    sed -i '/GoogleDrive/d' "${GTK_BM}"
-fi
+rm -f "${AGENT}"
 
 log_success "Google Drive Desktop Agent has been uninstalled."
-echo -e "\nNote: Your configuration in ${HOME}/.config/google-drive-agent and cached files were kept intact."
-echo -e "To completely purge configurations, delete: ${HOME}/.config/google-drive-agent and ${HOME}/.cache/rclone\n"
+echo -e "\nNote: Your configuration in ${CONFIG_HOME}/google-drive-agent and cached files were kept intact."
+echo -e "To completely purge everything, delete: ${CONFIG_HOME}/google-drive-agent, ${XDG_CACHE_HOME:-${HOME}/.cache}/google-drive-agent"
+echo -e "and ${XDG_CACHE_HOME:-${HOME}/.cache}/rclone, and run: rclone config delete gdrive\n"

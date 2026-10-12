@@ -6,157 +6,459 @@ system tray indicator, file manager integration, and automatic syncing).
 """
 
 import argparse
+import base64
+import contextlib
+import errno
 import fcntl
 import json
 import os
+import re
+import secrets
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
+
+
+def _xdg_dir(var, fallback):
+    # The XDG spec says relative paths must be ignored.
+    path = os.environ.get(var, "")
+    return path if os.path.isabs(path) else os.path.expanduser(fallback)
+
+
+XDG_CONFIG_HOME = _xdg_dir("XDG_CONFIG_HOME", "~/.config")
+XDG_CACHE_HOME = _xdg_dir("XDG_CACHE_HOME", "~/.cache")
+
+CONFIG_DIR = os.path.join(XDG_CONFIG_HOME, "google-drive-agent")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+RC_AUTH_PATH = os.path.join(CONFIG_DIR, "rc-auth.json")
+ICON_PATH = os.path.join(CONFIG_DIR, "icons", "google-drive.png")
+CACHE_DIR = os.path.join(XDG_CACHE_HOME, "google-drive-agent")
+LOG_PATH = os.path.join(CACHE_DIR, "rclone.log")
+BIN_DIR = os.path.expanduser("~/.local/bin")
+SERVICE_NAME = "google-drive.service"
+SERVICE_PATH = os.path.join(XDG_CONFIG_HOME, "systemd", "user", SERVICE_NAME)
+AUTOSTART_PATH = os.path.join(XDG_CONFIG_HOME, "autostart", "google-drive-agent.desktop")
+BOOKMARKS_PATH = os.path.join(XDG_CONFIG_HOME, "gtk-3.0", "bookmarks")
+BOOKMARK_LABEL = "Google Drive"
+
+# Exit code for "nothing to do / cannot run yet" (not authenticated, already
+# mounted elsewhere). The systemd unit lists it in RestartPreventExitStatus so
+# these cases don't turn into an endless restart loop.
+EXIT_NOT_READY = 3
 
 DEFAULT_CONFIG = {
     "remote_name": "gdrive",
-    "mount_path": os.path.expanduser("~/GoogleDrive"),
+    "mount_path": "~/GoogleDrive",
     "vfs_cache_mode": "full",
     "vfs_cache_max_size": "50G",
     "vfs_cache_max_age": "72h",
+    "vfs_cache_min_free_space": "10G",
     "vfs_read_chunk_size": "32M",
     "vfs_read_chunk_size_limit": "2G",
-    "buffer_size": "64M",
+    "buffer_size": "16M",
+    "drive_chunk_size": "64M",
     "dir_cache_time": "72h",
     "poll_interval": "15s",
     "export_formats": "link.html",
+    "log_level": "NOTICE",
     "rc_port": 5572,
     "client_id": "",
     "client_secret": ""
 }
 
-CONFIG_DIR = os.path.expanduser("~/.config/google-drive-agent")
-CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
-LOCK_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "google-drive-tray.lock")
-ICON_PATH = os.path.join(CONFIG_DIR, "icons", "google-drive.png")
+_SIZE = r"off|\d+(?:\.\d+)?(?:[bBkKMGTP]i?)?"
+_DURATION = r"off|0|(?:\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h|d|w|M|y))+"
+CONFIG_PATTERNS = {
+    # No leading "-" so the value can never be parsed as an rclone flag.
+    "remote_name": r"[A-Za-z0-9_][A-Za-z0-9_.+@-]*",
+    "vfs_cache_mode": r"off|minimal|writes|full",
+    "vfs_cache_max_size": _SIZE,
+    "vfs_cache_max_age": _DURATION,
+    "vfs_cache_min_free_space": rf"|{_SIZE}",  # "" omits the flag
+    "vfs_read_chunk_size": _SIZE,
+    "vfs_read_chunk_size_limit": _SIZE,
+    "buffer_size": _SIZE,
+    "drive_chunk_size": rf"|{_SIZE}",  # "" omits the flag
+    "dir_cache_time": _DURATION,
+    "poll_interval": _DURATION,
+    "export_formats": r"[A-Za-z0-9.]+(?:,[A-Za-z0-9.]+)*",
+    "log_level": r"DEBUG|INFO|NOTICE|ERROR",
+    "client_id": r"[^\s]*",
+    "client_secret": r"[^\s]*",
+}
+
+_config_lock = threading.Lock()
+_config_cache = {"key": None, "cfg": None}
+
+
+def warn(message):
+    print(f"[WARN] {message}", file=sys.stderr)
+
+
+def _write_file(path, text, mode=0o644):
+    """Atomically replace path with text, created with the given permissions."""
+    path = os.path.realpath(path)  # write through symlinks (e.g. dotfile managers)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=f".{os.path.basename(path)}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _is_valid(key, value):
+    if key == "rc_port":
+        return isinstance(value, int) and not isinstance(value, bool) and 1024 <= value <= 65535
+    if not isinstance(value, str):
+        return False
+    if key == "mount_path":
+        return bool(value.strip())
+    return re.fullmatch(CONFIG_PATTERNS[key], value) is not None
+
 
 def load_config():
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    if os.path.exists(CONFIG_PATH):
+    """Return the validated config. The file is only re-read when it changes."""
+    with _config_lock:
+        os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
         try:
-            with open(CONFIG_PATH, "r") as f:
-                cfg = json.load(f)
-                res = DEFAULT_CONFIG.copy()
-                res.update(cfg)
-                res["mount_path"] = os.path.expanduser(res["mount_path"])
-                return res
-        except Exception as e:
-            print(f"[WARN] Failed to load config file: {e}", file=sys.stderr)
-    save_config(DEFAULT_CONFIG)
-    return DEFAULT_CONFIG.copy()
+            st = os.stat(CONFIG_PATH)
+        except FileNotFoundError:
+            save_config(DEFAULT_CONFIG)
+            st = os.stat(CONFIG_PATH)
+        key = (st.st_mtime_ns, st.st_size, st.st_ino)
+        if _config_cache["key"] == key:
+            return _config_cache["cfg"]
+
+        # The file may hold an OAuth client secret: keep it private.
+        if st.st_mode & 0o077:
+            with contextlib.suppress(OSError):
+                os.chmod(CONFIG_PATH, 0o600)
+
+        user_cfg = {}
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                user_cfg = json.load(f)
+            if not isinstance(user_cfg, dict):
+                raise ValueError("top-level value must be a JSON object")
+        except (OSError, ValueError) as e:
+            # Never overwrite a broken file: it may contain the user's credentials.
+            warn(f"Failed to load {CONFIG_PATH}: {e}. Using defaults; the file was left untouched.")
+            user_cfg = {}
+
+        cfg = DEFAULT_CONFIG.copy()
+        for k, v in user_cfg.items():
+            if k not in DEFAULT_CONFIG:
+                warn(f"Ignoring unknown config key '{k}'.")
+            elif _is_valid(k, v):
+                cfg[k] = v
+            else:
+                warn(f"Invalid value for '{k}': {v!r}. Using default {DEFAULT_CONFIG[k]!r}.")
+        cfg["mount_path"] = os.path.abspath(os.path.expanduser(cfg["mount_path"]))
+
+        _config_cache.update(key=key, cfg=cfg)
+        return cfg
+
 
 def save_config(cfg):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    _write_file(CONFIG_PATH, json.dumps(cfg, indent=2) + "\n", mode=0o600)
+
+
+def _read_rc_credentials():
+    try:
+        with open(RC_AUTH_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data.get("user"), str) and isinstance(data.get("pass"), str) and data["pass"]:
+            return data["user"], data["pass"]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def get_rc_credentials():
+    """Return (user, password) for the rclone remote-control API, generating them once."""
+    creds = _read_rc_credentials()
+    if creds:
+        return creds
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    data = {"user": "google-drive-agent", "pass": secrets.token_urlsafe(32)}
+    fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".rc-auth.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        if os.path.exists(RC_AUTH_PATH):
+            os.replace(tmp, RC_AUTH_PATH)  # existing file is corrupt
+        else:
+            # link() fails if another process created the file first; we then use theirs.
+            with contextlib.suppress(FileExistsError):
+                os.link(tmp, RC_AUTH_PATH)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+    return _read_rc_credentials() or (data["user"], data["pass"])
+
 
 def notify(title, message, urgency="normal"):
-    try:
-        cmd = ["notify-send", "-a", "Google Drive", "-u", urgency, title, message]
-        if os.path.exists(ICON_PATH):
-            cmd.extend(["-i", ICON_PATH])
-        subprocess.run(cmd, check=False)
-    except Exception:
-        pass
+    if not shutil.which("notify-send"):
+        return
+    cmd = ["notify-send", "-a", "Google Drive", "-u", urgency, title, message]
+    if os.path.exists(ICON_PATH):
+        cmd.extend(["-i", ICON_PATH])
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(cmd, check=False, stdin=subprocess.DEVNULL, timeout=5)
+
+
+def find_rclone():
+    # ~/.local/bin is often missing from PATH under the systemd user manager.
+    path = shutil.which("rclone")
+    if path:
+        return path
+    fallback = os.path.join(BIN_DIR, "rclone")
+    return fallback if os.access(fallback, os.X_OK) else None
+
 
 def is_rclone_available():
-    return shutil.which("rclone") is not None
+    return find_rclone() is not None
+
+
+_rclone_conf = {"path": None}
+_remotes_cache = {"key": None, "remotes": set()}
+
+
+def _rclone_config_path(rclone):
+    if _rclone_conf["path"] is None:
+        path = ""
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            res = subprocess.run([rclone, "config", "file"], capture_output=True, text=True,
+                                 stdin=subprocess.DEVNULL, timeout=10)
+            lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
+            path = lines[-1] if lines else ""
+        _rclone_conf["path"] = path
+    return _rclone_conf["path"] or None
+
+
+def list_remotes():
+    """Return configured rclone remote names. Reads rclone.conf directly when possible
+    so periodic status checks don't spawn an rclone process each time."""
+    rclone = find_rclone()
+    if not rclone:
+        return set()
+    path = _rclone_config_path(rclone)
+    key = None
+    if path:
+        try:
+            st = os.stat(path)
+            key = (path, st.st_mtime_ns, st.st_size)
+        except FileNotFoundError:
+            return set()
+        except OSError:
+            pass
+    if key is not None and key == _remotes_cache["key"]:
+        return _remotes_cache["remotes"]
+
+    remotes = None
+    if key is not None:
+        with contextlib.suppress(OSError):
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            if not text.startswith("# Encrypted rclone configuration File"):
+                remotes = set(re.findall(r"^\[([^\]\n]+)\]\s*$", text, re.MULTILINE))
+    if remotes is None:
+        # Encrypted or unreadable config: let rclone answer.
+        try:
+            res = subprocess.run([rclone, "listremotes"], capture_output=True, text=True,
+                                 check=True, stdin=subprocess.DEVNULL, timeout=10)
+            remotes = {r.strip().rstrip(":") for r in res.stdout.splitlines() if r.strip()}
+        except (OSError, subprocess.SubprocessError):
+            remotes = set()
+    _remotes_cache.update(key=key, remotes=remotes)
+    return remotes
+
 
 def is_authenticated(remote_name):
-    if not is_rclone_available():
-        return False
-    try:
-        res = subprocess.run(["rclone", "listremotes"], capture_output=True, text=True, check=True)
-        remotes = [r.strip().rstrip(":") for r in res.stdout.splitlines() if r.strip()]
-        return remote_name in remotes
-    except Exception:
-        return False
+    return remote_name in list_remotes()
+
+
+def _resolve_mount_path(mount_path):
+    """Canonicalise mount_path without touching the mount point itself,
+    which would block if the FUSE mount is hung."""
+    mount_path = os.path.abspath(os.path.expanduser(mount_path))
+    parent, name = os.path.split(mount_path)
+    return os.path.join(os.path.realpath(parent), name)
+
+
+def _unescape_mount_field(field):
+    # /proc/self/mounts escapes space, tab, newline and backslash as \ooo.
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
 
 def is_mounted(mount_path):
-    real_path = os.path.realpath(os.path.expanduser(mount_path))
+    target = _resolve_mount_path(mount_path)
     try:
-        with open("/proc/mounts", "r") as f:
+        with open("/proc/self/mounts", "r", encoding="utf-8", errors="surrogateescape") as f:
             for line in f:
                 parts = line.split()
-                if len(parts) >= 2 and os.path.realpath(parts[1]) == real_path:
+                if len(parts) >= 2 and _unescape_mount_field(parts[1]) == target:
                     return True
-    except Exception:
-        pass
-    return os.path.ismount(real_path)
+        return False
+    except OSError:
+        return os.path.ismount(target)
 
-def update_bookmarks(mount_path):
-    bm_file = os.path.expanduser("~/.config/gtk-3.0/bookmarks")
-    real_path = os.path.realpath(os.path.expanduser(mount_path))
-    entry = f"file://{real_path} Google Drive"
+
+def _is_stale_mount(mount_path):
+    """True if the mount point is left over from a crashed rclone process."""
     try:
-        os.makedirs(os.path.dirname(bm_file), exist_ok=True)
-        lines = []
-        if os.path.exists(bm_file):
-            with open(bm_file, "r") as f:
-                lines = [l.strip() for l in f if l.strip()]
-        if not any(l.startswith(f"file://{real_path}") for l in lines):
-            lines.append(entry)
-            with open(bm_file, "w") as f:
-                f.write("\n".join(lines) + "\n")
-    except Exception as e:
-        print(f"[WARN] Could not update GTK bookmarks: {e}", file=sys.stderr)
+        os.stat(mount_path)
+    except OSError as e:
+        return e.errno == errno.ENOTCONN
+    return False
 
-def setup_auth(interactive=True):
+
+def _fusermount(mount_path, lazy=False):
+    flags = "-uz" if lazy else "-u"
+    res = None
+    for tool in ("fusermount3", "fusermount"):
+        if shutil.which(tool):
+            res = subprocess.run([tool, flags, mount_path], capture_output=True, text=True,
+                                 stdin=subprocess.DEVNULL)
+            if res.returncode == 0:
+                return True, ""
+    return False, (res.stderr.strip() if res else "fusermount/fusermount3 not found")
+
+
+def _bookmark_uri(mount_path):
+    return "file://" + urllib.parse.quote(_resolve_mount_path(mount_path))
+
+
+def _bookmark_points_to(line, uri):
+    target = line.split(" ", 1)[0]
+    return urllib.parse.unquote(target) == urllib.parse.unquote(uri)
+
+
+def _read_bookmarks():
+    try:
+        with open(BOOKMARKS_PATH, "r", encoding="utf-8") as f:
+            return [l.rstrip("\n") for l in f if l.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def _bookmarks_mode():
+    try:
+        return os.stat(BOOKMARKS_PATH).st_mode & 0o777
+    except OSError:
+        return 0o644
+
+
+def add_bookmark(mount_path):
+    uri = _bookmark_uri(mount_path)
+    try:
+        os.makedirs(_resolve_mount_path(mount_path), exist_ok=True)
+        lines = _read_bookmarks()
+        if not any(_bookmark_points_to(l, uri) for l in lines):
+            lines.append(f"{uri} {BOOKMARK_LABEL}")
+            _write_file(BOOKMARKS_PATH, "\n".join(lines) + "\n", mode=_bookmarks_mode())
+        return True
+    except OSError as e:
+        warn(f"Could not update GTK bookmarks: {e}")
+        return False
+
+
+def remove_bookmark(mount_path):
+    uri = _bookmark_uri(mount_path)
+    try:
+        lines = _read_bookmarks()
+        kept = [l for l in lines if not _bookmark_points_to(l, uri)]
+        if kept != lines:
+            _write_file(BOOKMARKS_PATH, "\n".join(kept) + ("\n" if kept else ""), mode=_bookmarks_mode())
+        return True
+    except OSError as e:
+        warn(f"Could not update GTK bookmarks: {e}")
+        return False
+
+
+def _systemctl(*args):
+    if not shutil.which("systemctl"):
+        return None
+    try:
+        return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def service_is_enabled():
+    """True when the systemd user service is installed and owns the mount."""
+    if not os.path.exists(SERVICE_PATH):
+        return False
+    res = _systemctl("is-enabled", SERVICE_NAME)
+    return bool(res) and res.stdout.strip() in ("enabled", "enabled-runtime")
+
+
+def service_is_active():
+    if not os.path.exists(SERVICE_PATH):
+        return False
+    res = _systemctl("is-active", SERVICE_NAME)
+    return bool(res) and res.stdout.strip() in ("active", "activating", "reloading")
+
+
+def _running_inside_service():
+    invocation = os.environ.get("INVOCATION_ID")
+    if not invocation:
+        return False
+    res = _systemctl("show", "-p", "InvocationID", "--value", SERVICE_NAME)
+    return bool(res) and res.stdout.strip() == invocation
+
+
+def setup_auth():
     cfg = load_config()
     remote = cfg["remote_name"]
+    rclone = find_rclone()
+    if not rclone:
+        print("Error: rclone is not installed. Run install.sh first.", file=sys.stderr)
+        return False
     print(f"Setting up Google Drive authentication for remote '{remote}'...")
     print("This will open your web browser to sign in to your Google Account.")
-    
+
     cmd = [
-        "rclone", "config", "create", remote, "drive",
+        rclone, "config", "create", remote, "drive",
         "scope", "drive",
         "config_shared_client_id", "true",
         "config_is_local", "true"
     ]
-    if cfg.get("client_id") and cfg.get("client_secret"):
+    if cfg["client_id"] and cfg["client_secret"]:
         cmd.extend(["client_id", cfg["client_id"], "client_secret", cfg["client_secret"]])
 
     try:
         subprocess.run(cmd, check=True)
-        print("\nAuthentication successful!")
-        notify("Google Drive", "Account connected successfully!")
-        update_bookmarks(cfg["mount_path"])
-        return True
     except subprocess.CalledProcessError as e:
         print(f"\nAuthentication failed with code {e.returncode}.", file=sys.stderr)
         notify("Google Drive Error", "Authentication failed. Please try again.", urgency="critical")
         return False
 
-def mount_drive(foreground=False):
-    cfg = load_config()
-    remote = cfg["remote_name"]
-    mount_path = os.path.expanduser(cfg["mount_path"])
+    print("\nAuthentication successful!")
+    notify("Google Drive", "Account connected successfully!")
+    add_bookmark(cfg["mount_path"])
+    mount_drive()
+    return True
 
-    if not is_authenticated(remote):
-        print(f"Error: Remote '{remote}' is not configured.", file=sys.stderr)
-        print("Run 'google-drive-agent setup' to authenticate first.", file=sys.stderr)
-        notify("Google Drive", "Not authenticated. Run setup first.", urgency="critical")
-        return False
 
-    if is_mounted(mount_path):
-        print(f"Google Drive is already mounted at {mount_path}.")
-        return True
-
-    os.makedirs(mount_path, exist_ok=True)
-    update_bookmarks(mount_path)
-
+def build_mount_cmd(cfg, rclone, daemon):
     cmd = [
-        "rclone", "mount", f"{remote}:", mount_path,
+        rclone, "mount", f"{cfg['remote_name']}:", cfg["mount_path"],
         "--vfs-cache-mode", cfg["vfs_cache_mode"],
         "--vfs-cache-max-size", cfg["vfs_cache_max_size"],
         "--vfs-cache-max-age", cfg["vfs_cache_max_age"],
@@ -166,133 +468,247 @@ def mount_drive(foreground=False):
         "--dir-cache-time", cfg["dir_cache_time"],
         "--poll-interval", cfg["poll_interval"],
         "--drive-export-formats", cfg["export_formats"],
-        "--drive-pacer-min-sleep", "10ms",
-        "--drive-pacer-burst", "200",
+        "--log-level", cfg["log_level"],
+        # Authenticated via RCLONE_RC_USER/RCLONE_RC_PASS in the environment,
+        # which (unlike argv) other users cannot read.
         "--rc",
         "--rc-addr", f"127.0.0.1:{cfg['rc_port']}",
-        "--rc-no-auth",
         "--umask", "022"
     ]
+    if cfg["vfs_cache_min_free_space"]:
+        cmd += ["--vfs-cache-min-free-space", cfg["vfs_cache_min_free_space"]]
+    if cfg["drive_chunk_size"]:
+        cmd += ["--drive-chunk-size", cfg["drive_chunk_size"]]
+    if daemon:
+        cmd += ["--daemon", "--log-file", LOG_PATH]
+    return cmd
+
+
+def _rclone_env():
+    user, password = get_rc_credentials()
+    env = os.environ.copy()
+    env["RCLONE_RC_USER"] = user
+    env["RCLONE_RC_PASS"] = password
+    return env
+
+
+def _wait_until(predicate, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.5)
+    return predicate()
+
+
+def mount_drive(foreground=False):
+    """Mount the drive. Returns True on success, False on failure and
+    EXIT_NOT_READY when there is nothing to do yet."""
+    cfg = load_config()
+    remote = cfg["remote_name"]
+    mount_path = cfg["mount_path"]
+    rclone = find_rclone()
+
+    if not rclone:
+        print("Error: rclone is not installed. Run install.sh first.", file=sys.stderr)
+        return EXIT_NOT_READY
+    if not is_authenticated(remote):
+        print(f"Error: Remote '{remote}' is not configured.", file=sys.stderr)
+        print("Run 'google-drive-agent setup' to authenticate first.", file=sys.stderr)
+        notify("Google Drive", "Not authenticated. Run setup first.", urgency="critical")
+        return EXIT_NOT_READY
+
+    # When the systemd service is enabled it owns the mount; don't start a second rclone.
+    if not foreground and service_is_enabled():
+        print("Starting systemd service...")
+        res = _systemctl("start", SERVICE_NAME)
+        if res and res.returncode == 0 and _wait_until(lambda: is_mounted(mount_path), 10):
+            print(f"Mounted successfully at {mount_path}.")
+            notify("Google Drive", f"Mounted and streaming at {mount_path}")
+            return True
+        print(f"Mount failed. See: journalctl --user -u {SERVICE_NAME}", file=sys.stderr)
+        notify("Google Drive Error", "Mount failed. Check the service logs.", urgency="critical")
+        return False
+
+    if is_mounted(mount_path):
+        if not _is_stale_mount(mount_path):
+            print(f"Google Drive is already mounted at {mount_path}.")
+            return EXIT_NOT_READY if foreground else True
+        print("Cleaning up stale mount left by a previous rclone process...")
+        _fusermount(mount_path, lazy=True)
+
+    try:
+        os.makedirs(mount_path, exist_ok=True)
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+    except OSError as e:
+        print(f"Error: cannot create {mount_path}: {e}", file=sys.stderr)
+        return False
+    add_bookmark(mount_path)
+
+    cmd = build_mount_cmd(cfg, rclone, daemon=not foreground)
+    env = _rclone_env()
 
     if foreground:
-        print(f"Mounting {remote}: at {mount_path} in foreground...")
-        try:
-            subprocess.run(cmd, check=True)
-            return True
-        except KeyboardInterrupt:
-            print("\nUnmounting...")
-            unmount_drive()
-            return True
-    else:
-        cmd.append("--daemon")
-        print(f"Mounting {remote}: at {mount_path} in background...")
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode == 0:
-            for _ in range(15):
-                time.sleep(0.5)
-                if is_mounted(mount_path):
-                    print(f"Mounted successfully at {mount_path}.")
-                    notify("Google Drive", f"Mounted and streaming at {mount_path}")
-                    return True
-            print("Mount process launched, checking status...")
-            return True
-        else:
-            print(f"Mount failed: {res.stderr}", file=sys.stderr)
-            notify("Google Drive Error", f"Mount failed: {res.stderr.strip()}", urgency="critical")
-            return False
+        print(f"Mounting {remote}: at {mount_path} in foreground...", flush=True)
+        # Replace this process so systemd supervises rclone directly
+        # (sd_notify readiness, signals, exit status).
+        os.execve(rclone, cmd, env)
+
+    print(f"Mounting {remote}: at {mount_path} in background...")
+    # Not a pipe: the daemonised child inherits stderr and would keep a pipe open forever.
+    with tempfile.TemporaryFile(mode="w+") as err:
+        res = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
+                             text=True, env=env)
+        err.seek(0)
+        stderr = err.read().strip()
+    if res.returncode == 0 and _wait_until(lambda: is_mounted(mount_path), 10):
+        print(f"Mounted successfully at {mount_path}.")
+        notify("Google Drive", f"Mounted and streaming at {mount_path}")
+        return True
+    detail = stderr or f"mount not detected; see {LOG_PATH}"
+    print(f"Mount failed: {detail}", file=sys.stderr)
+    notify("Google Drive Error", f"Mount failed: {detail}", urgency="critical")
+    return False
+
 
 def unmount_drive():
     cfg = load_config()
-    mount_path = os.path.expanduser(cfg["mount_path"])
+    mount_path = cfg["mount_path"]
+
+    # Stopping the service from one of its own Exec* commands would deadlock.
+    if service_is_active() and not _running_inside_service():
+        print("Stopping systemd service...")
+        _systemctl("stop", SERVICE_NAME)
+
     if not is_mounted(mount_path):
         print(f"Google Drive is not mounted at {mount_path}.")
         return True
 
     print(f"Unmounting {mount_path}...")
-    res = subprocess.run(["fusermount3", "-u", mount_path], capture_output=True, text=True)
-    if res.returncode != 0:
-        res = subprocess.run(["fusermount", "-u", mount_path], capture_output=True, text=True)
-    if res.returncode == 0:
+    ok, err = _fusermount(mount_path)
+    if ok:
         print("Unmounted successfully.")
         notify("Google Drive", "Google Drive has been unmounted.")
         return True
-    else:
-        print(f"Unmount failed: {res.stderr}", file=sys.stderr)
-        return False
+    print(f"Unmount failed: {err}", file=sys.stderr)
+    notify("Google Drive Error", f"Unmount failed: {err}", urgency="critical")
+    return False
+
+
+def _human_size(b):
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if b < 1024.0:
+            return f"{b:.1f} {unit}"
+        b /= 1024.0
+    return f"{b:.1f} PB"
+
 
 def get_quota_info():
     cfg = load_config()
     remote = cfg["remote_name"]
-    if not is_authenticated(remote):
+    rclone = find_rclone()
+    if not rclone or not is_authenticated(remote):
         return None
     try:
-        res = subprocess.run(["rclone", "about", f"{remote}:", "--json"], capture_output=True, text=True, check=True, timeout=8)
+        res = subprocess.run([rclone, "about", f"{remote}:", "--json"], capture_output=True, text=True,
+                             check=True, stdin=subprocess.DEVNULL, timeout=8)
         data = json.loads(res.stdout)
-        total = data.get("total", 0)
-        used = data.get("used", 0)
-        free = data.get("free", 0)
-        pct = (used / total * 100) if total > 0 else 0
-        def human(b):
-            for unit in ["B", "KB", "MB", "GB", "TB"]:
-                if b < 1024.0:
-                    return f"{b:.1f} {unit}"
-                b /= 1024.0
-            return f"{b:.1f} PB"
-        return {
-            "total_bytes": total,
-            "used_bytes": used,
-            "free_bytes": free,
-            "total_str": human(total),
-            "used_str": human(used),
-            "free_str": human(free),
-            "percent": pct,
-            "summary": f"{human(used)} of {human(total)} used ({pct:.1f}%)"
-        }
-    except Exception:
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
+    total = data.get("total", 0)
+    used = data.get("used", 0)
+    free = data.get("free", 0)
+    pct = (used / total * 100) if total > 0 else 0
+    return {
+        "total_bytes": total,
+        "used_bytes": used,
+        "free_bytes": free,
+        "total_str": _human_size(total),
+        "used_str": _human_size(used),
+        "free_str": _human_size(free),
+        "percent": pct,
+        "summary": f"{_human_size(used)} of {_human_size(total)} used ({pct:.1f}%)"
+    }
 
-def trigger_cache_refresh():
+
+def trigger_cache_refresh(path=""):
+    """Re-read the remote directory tree (recursively) from path, default the root."""
     cfg = load_config()
-    port = cfg["rc_port"]
-    url = f"http://127.0.0.1:{port}/vfs/refresh"
+    if not is_mounted(cfg["mount_path"]):
+        print("Google Drive is not mounted; nothing to refresh.", file=sys.stderr)
+        return False
+
+    user, password = get_rc_credentials()
+    params = {"recursive": True, "_async": True}
+    if path:
+        params["dir"] = path.strip("/")
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{cfg['rc_port']}/vfs/refresh",
+        data=json.dumps(params).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Basic {token}"},
+    )
+    # Never route this through an HTTP proxy: it would receive the credentials.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        req = urllib.request.Request(url, data=b"{}", headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            notify("Google Drive", "File cache refreshed successfully.")
-            return True
-    except Exception as e:
+        with opener.open(req, timeout=10) as resp:
+            json.load(resp)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            print("Cache refresh rejected: the running mount uses different credentials. "
+                  "Unmount and mount again to apply them.", file=sys.stderr)
+        else:
+            print(f"Cache refresh failed: HTTP {e.code}", file=sys.stderr)
+        return False
+    except (OSError, ValueError) as e:
         print(f"Cache refresh failed: {e}", file=sys.stderr)
         return False
+    print("Cache refresh started in the background.")
+    notify("Google Drive", "Refreshing file list from Google Drive...")
+    return True
+
 
 def open_folder():
     cfg = load_config()
-    mount_path = os.path.expanduser(cfg["mount_path"])
+    mount_path = cfg["mount_path"]
     if not is_mounted(mount_path):
-        if is_authenticated(cfg["remote_name"]):
-            mount_drive(foreground=False)
-        else:
+        if not is_authenticated(cfg["remote_name"]):
             notify("Google Drive", "Please set up your account first.")
-            return
-    subprocess.Popen(["xdg-open", mount_path])
+            return False
+        if mount_drive() is not True:
+            return False
+    subprocess.Popen(["xdg-open", mount_path], stdin=subprocess.DEVNULL)
+    return True
+
 
 def open_web():
-    subprocess.Popen(["xdg-open", "https://drive.google.com"])
+    subprocess.Popen(["xdg-open", "https://drive.google.com"], stdin=subprocess.DEVNULL)
+    return True
+
 
 def show_status():
     cfg = load_config()
     remote = cfg["remote_name"]
-    mount_path = os.path.expanduser(cfg["mount_path"])
+    mount_path = cfg["mount_path"]
     auth = is_authenticated(remote)
     mounted = is_mounted(mount_path)
+    if os.path.exists(SERVICE_PATH):
+        service = "enabled" if service_is_enabled() else "installed, disabled"
+        service += ", running" if service_is_active() else ", stopped"
+    else:
+        service = "not installed"
 
     print("================ Google Drive Desktop Agent ================")
     print(f"Remote Name   : {remote}")
+    print(f"rclone        : {find_rclone() or 'NOT FOUND'}")
     print(f"Authenticated : {'Yes' if auth else 'No (Run: google-drive-agent setup)'}")
     print(f"Mount Point   : {mount_path}")
     print(f"Mount Status  : {'Mounted (Streaming on-demand)' if mounted else 'Not Mounted'}")
+    print(f"Service       : {service}")
     print(f"Cache Mode    : {cfg['vfs_cache_mode']} (Max Size: {cfg['vfs_cache_max_size']}, Max Age: {cfg['vfs_cache_max_age']})")
     print(f"Sync Interval : {cfg['poll_interval']}")
-    
+    print(f"Logs          : journalctl --user -u {SERVICE_NAME}  |  {LOG_PATH}")
+
     if auth:
         print("\nChecking Google Drive storage quota...")
         quota = get_quota_info()
@@ -301,75 +717,102 @@ def show_status():
         else:
             print("Storage Quota : Unable to query (network or offline)")
     print("============================================================")
+    return True
 
-def install_systemd_service():
-    service_dir = os.path.expanduser("~/.config/systemd/user")
-    os.makedirs(service_dir, exist_ok=True)
-    service_path = os.path.join(service_dir, "google-drive.service")
-    
-    agent_bin = shutil.which("google-drive-agent") or os.path.expanduser("~/.local/bin/google-drive-agent")
 
+def _agent_path():
+    return os.path.abspath(__file__)
+
+
+def _systemd_quote(arg):
+    arg = arg.replace("%", "%%")
+    if re.search(r"[\s\"'\\]", arg):
+        arg = '"' + arg.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return arg
+
+
+def _desktop_quote(arg):
+    if re.search(r"[\s\"'\\><~|&;$*?#()`]", arg):
+        arg = '"' + re.sub(r'(["`$\\])', r"\\\1", arg) + '"'
+    return arg.replace("%", "%%")
+
+
+def install_systemd_service(start=True):
+    agent = _agent_path()
     unit_content = f"""[Unit]
 Description=Google Drive for Desktop (VFS Streaming Mount)
-Documentation=https://support.google.com/a/users/answer/13022292
+Documentation=https://github.com/hall9000bowman/google-drive-linux
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
-ExecStart={agent_bin} mount-foreground
-ExecStop={agent_bin} unmount
+Type=notify
+ExecStart={_systemd_quote(agent)} mount-foreground
 Restart=on-failure
 RestartSec=10
+RestartPreventExitStatus={EXIT_NOT_READY}
 
 [Install]
 WantedBy=default.target
 """
-    with open(service_path, "w") as f:
-        f.write(unit_content)
-    
-    autostart_dir = os.path.expanduser("~/.config/autostart")
-    os.makedirs(autostart_dir, exist_ok=True)
-    autostart_path = os.path.join(autostart_dir, "google-drive-agent.desktop")
-    
+    _write_file(SERVICE_PATH, unit_content)
+
     autostart_content = f"""[Desktop Entry]
 Name=Google Drive Agent
 Comment=Google Drive for Desktop Background Agent
-Exec={agent_bin} tray
+Exec={_desktop_quote(agent)} tray
 Icon={ICON_PATH}
 Terminal=false
 Type=Application
 Categories=Utility;Network;
 X-GNOME-Autostart-enabled=true
 """
-    with open(autostart_path, "w") as f:
-        f.write(autostart_content)
+    _write_file(AUTOSTART_PATH, autostart_content)
 
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-    subprocess.run(["systemctl", "--user", "enable", "--now", "google-drive.service"], check=False)
+    if not shutil.which("systemctl"):
+        warn("systemctl not found: the tray will mount Google Drive on login instead.")
+        return True
+    _systemctl("daemon-reload")
+    res = _systemctl("enable", *(["--now"] if start else []), SERVICE_NAME)
+    if not res or res.returncode != 0:
+        warn(f"Could not enable {SERVICE_NAME}: {res.stderr.strip() if res else 'systemctl failed'}")
+        return False
     print("Systemd user service installed and enabled.")
     print("Google Drive will now automatically mount and stream on login!")
+    return True
+
 
 def remove_systemd_service():
-    subprocess.run(["systemctl", "--user", "stop", "google-drive.service"], check=False)
-    subprocess.run(["systemctl", "--user", "disable", "google-drive.service"], check=False)
-    service_path = os.path.expanduser("~/.config/systemd/user/google-drive.service")
-    if os.path.exists(service_path):
-        os.remove(service_path)
-    autostart_path = os.path.expanduser("~/.config/autostart/google-drive-agent.desktop")
-    if os.path.exists(autostart_path):
-        os.remove(autostart_path)
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    _systemctl("disable", "--now", SERVICE_NAME)
+    for path in (SERVICE_PATH, AUTOSTART_PATH):
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(path)
+    _systemctl("daemon-reload")
     print("Systemd user service and autostart removed.")
+    return True
+
+
+def _lock_path():
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    try:
+        st = os.stat(runtime) if runtime else None
+    except OSError:
+        st = None
+    # Only trust the runtime dir if it is really ours and private.
+    if st and st.st_uid == os.getuid() and not st.st_mode & 0o077:
+        return os.path.join(runtime, "google-drive-tray.lock")
+    os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+    return os.path.join(CACHE_DIR, "tray.lock")
+
 
 def run_tray():
-    # Enforce single instance
-    _lock_fd = open(LOCK_FILE, "w")
+    # Enforce single instance. No O_TRUNC and no symlink following.
+    lock_fd = os.open(_lock_path(), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
-        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         print("Google Drive tray is already running.", file=sys.stderr)
-        sys.exit(0)
+        return True
 
     import gi
     gi.require_version("Gtk", "3.0")
@@ -389,12 +832,19 @@ def run_tray():
 
     if AppIndicator3 is None:
         print("[ERROR] Neither AppIndicator3 nor AyatanaAppIndicator3 is available.", file=sys.stderr)
-        sys.exit(1)
+        return False
+
+    def run_in_background(func, *args):
+        threading.Thread(target=func, args=args, daemon=True).start()
 
     class GoogleDriveTray:
+        QUOTA_INTERVAL = 300
+
         def __init__(self):
-            self.cfg = load_config()
-            self.quota_str = "Storage: Loading..."
+            self.lock_fd = lock_fd
+            self.state = None
+            self.polling = False
+            self.quota_polling = False
             self.quota_timestamp = 0
 
             icon = ICON_PATH if os.path.exists(ICON_PATH) else "google-drive"
@@ -408,10 +858,7 @@ def run_tray():
             self._create_menu()
             self.indicator.set_menu(self.menu)
 
-            # Auto mount if authenticated and not mounted
-            if is_authenticated(self.cfg["remote_name"]) and not is_mounted(self.cfg["mount_path"]):
-                threading.Thread(target=mount_drive, args=(False,), daemon=True).start()
-
+            run_in_background(self._auto_mount)
             self._poll_status()
             GLib.timeout_add_seconds(5, self._poll_status)
 
@@ -430,7 +877,7 @@ def run_tray():
 
             # Open Folder
             self.item_open = Gtk.MenuItem(label="📁 Open Google Drive Folder")
-            self.item_open.connect("activate", lambda _: open_folder())
+            self.item_open.connect("activate", lambda _: run_in_background(open_folder))
             self.menu.append(self.item_open)
 
             # Open Web
@@ -442,7 +889,7 @@ def run_tray():
 
             # Sync / Refresh
             self.item_refresh = Gtk.MenuItem(label="🔄 Refresh / Sync Now")
-            self.item_refresh.connect("activate", lambda _: threading.Thread(target=trigger_cache_refresh, daemon=True).start())
+            self.item_refresh.connect("activate", lambda _: run_in_background(trigger_cache_refresh))
             self.menu.append(self.item_refresh)
 
             # Mount / Unmount Toggle
@@ -464,57 +911,111 @@ def run_tray():
 
             self.menu.show_all()
 
+        def _auto_mount(self):
+            cfg = load_config()
+            if is_authenticated(cfg["remote_name"]) and not is_mounted(cfg["mount_path"]):
+                mount_drive()
+            GLib.idle_add(self._poll_status)
+
+        def _then_poll(self, func):
+            def task():
+                func()
+                GLib.idle_add(self._poll_status)
+            run_in_background(task)
+
         def _on_toggle_mount(self, _):
-            mount_path = os.path.expanduser(self.cfg["mount_path"])
-            if is_mounted(mount_path):
-                threading.Thread(target=unmount_drive, daemon=True).start()
+            if self.state == "unauthenticated":
+                self._on_setup(None)
+            elif self.state == "mounted":
+                self._then_poll(unmount_drive)
             else:
-                threading.Thread(target=mount_drive, args=(False,), daemon=True).start()
+                self._then_poll(mount_drive)
 
         def _on_setup(self, _):
             # Launch terminal setup
             term = shutil.which("foot") or shutil.which("alacritty") or shutil.which("kitty") or shutil.which("konsole") or shutil.which("xterm")
-            agent_bin = shutil.which("google-drive-agent") or os.path.expanduser("~/.local/bin/google-drive-agent")
             if term:
-                subprocess.Popen([term, "-e", agent_bin, "setup"])
+                subprocess.Popen([term, "-e", _agent_path(), "setup"], stdin=subprocess.DEVNULL)
             else:
-                threading.Thread(target=setup_auth, daemon=True).start()
+                self._then_poll(setup_auth)
 
         def _poll_status(self):
-            auth = is_authenticated(self.cfg["remote_name"])
-            mounted = is_mounted(self.cfg["mount_path"])
+            # Status checks run off the GTK thread so a slow or hung mount can't freeze the UI.
+            if not self.polling:
+                self.polling = True
+                run_in_background(self._collect_status)
+            return True
 
+        def _collect_status(self):
+            try:
+                cfg = load_config()
+                auth = is_authenticated(cfg["remote_name"])
+                mounted = is_mounted(cfg["mount_path"])
+            except Exception as e:
+                warn(f"Status check failed: {e}")
+                self.polling = False
+                return
+            GLib.idle_add(self._apply_status, auth, mounted)
+
+        def _apply_status(self, auth, mounted):
+            self.polling = False
             if not auth:
+                self.state = "unauthenticated"
+                self.quota_timestamp = 0
                 self.item_header.set_label("Google Drive: Not Connected")
                 self.item_quota.set_label("Click 'Setup / Connect Account'")
-                self.item_mount_toggle.set_label("Connect Account")
-                self.item_mount_toggle.set_sensitive(True)
+                self.item_mount_toggle.set_label("🔑 Connect Account")
                 self.item_refresh.set_sensitive(False)
-            elif mounted:
-                self.item_header.set_label("Google Drive: Streaming (Up to date)")
+                return False
+
+            if mounted:
+                self.state = "mounted"
+                self.item_header.set_label("Google Drive: Streaming")
                 self.item_mount_toggle.set_label("⏸️ Disconnect / Unmount")
-                self.item_mount_toggle.set_sensitive(True)
                 self.item_refresh.set_sensitive(True)
             else:
+                self.state = "unmounted"
                 self.item_header.set_label("Google Drive: Unmounted")
                 self.item_mount_toggle.set_label("▶️ Connect / Mount")
-                self.item_mount_toggle.set_sensitive(True)
                 self.item_refresh.set_sensitive(False)
 
             # Update quota periodically
-            now = time.time()
-            if auth and (now - self.quota_timestamp > 300 or self.quota_timestamp == 0):
+            now = time.monotonic()
+            if not self.quota_polling and (self.quota_timestamp == 0 or now - self.quota_timestamp > self.QUOTA_INTERVAL):
+                self.quota_polling = True
                 self.quota_timestamp = now
-                def fetch_q():
-                    q = get_quota_info()
-                    if q:
-                        GLib.idle_add(lambda: self.item_quota.set_label(f"📊 Storage: {q['summary']}"))
-                threading.Thread(target=fetch_q, daemon=True).start()
+                if self.item_quota.get_label().startswith("Click"):
+                    self.item_quota.set_label("Storage: Checking...")
+                run_in_background(self._fetch_quota)
+            return False
 
-            return True
+        def _fetch_quota(self):
+            q = get_quota_info()
+            GLib.idle_add(self._apply_quota, q["summary"] if q else None)
 
-    app = GoogleDriveTray()
+        def _apply_quota(self, summary):
+            self.quota_polling = False
+            if summary:
+                self.item_quota.set_label(f"📊 Storage: {summary}")
+            return False
+
+    def quit_tray():
+        Gtk.main_quit()
+        return GLib.SOURCE_REMOVE
+
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        signal_add = GLibUnix.signal_add
+    except (ImportError, ValueError):
+        signal_add = GLib.unix_signal_add  # PyGObject < 3.52
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal_add(GLib.PRIORITY_DEFAULT, sig, quit_tray)
+
+    GoogleDriveTray()
     Gtk.main()
+    return True
+
 
 def main():
     parser = argparse.ArgumentParser(description="Google Drive Desktop Agent for Linux")
@@ -527,12 +1028,19 @@ def main():
     subparsers.add_parser("status", help="Show current status and storage quota")
     subparsers.add_parser("open", help="Open Google Drive folder in file manager (mounts if needed)")
     subparsers.add_parser("open-web", help="Open Google Drive web interface in browser")
-    subparsers.add_parser("refresh", help="Trigger cache refresh / sync")
+    refresh_parser = subparsers.add_parser("refresh", help="Re-read the Drive file list (recursively)")
+    refresh_parser.add_argument("path", nargs="?", default="", help="Folder inside the drive to refresh (default: everything)")
     subparsers.add_parser("tray", help="Run the system tray applet")
+
+    bm_parser = subparsers.add_parser("bookmark", help="Manage the file manager sidebar bookmark")
+    bm_sub = bm_parser.add_subparsers(dest="action")
+    bm_sub.add_parser("add", help="Add the Google Drive bookmark")
+    bm_sub.add_parser("remove", help="Remove the Google Drive bookmark")
 
     srv_parser = subparsers.add_parser("service", help="Manage systemd user service")
     srv_sub = srv_parser.add_subparsers(dest="action")
-    srv_sub.add_parser("install", help="Install and enable systemd user service")
+    install_parser = srv_sub.add_parser("install", help="Install and enable systemd user service")
+    install_parser.add_argument("--no-start", action="store_true", help="Enable the service without starting it now")
     srv_sub.add_parser("remove", help="Remove systemd user service")
     srv_sub.add_parser("status", help="Check systemd service status")
     srv_sub.add_parser("start", help="Start systemd service")
@@ -541,42 +1049,57 @@ def main():
     args = parser.parse_args()
 
     if args.command == "setup":
-        setup_auth()
+        result = setup_auth()
     elif args.command == "mount":
-        mount_drive(foreground=False)
+        result = mount_drive(foreground=False)
     elif args.command == "mount-foreground":
-        mount_drive(foreground=True)
+        result = mount_drive(foreground=True)
     elif args.command == "unmount":
-        unmount_drive()
+        result = unmount_drive()
     elif args.command == "status":
-        show_status()
+        result = show_status()
     elif args.command == "open":
-        open_folder()
+        result = open_folder()
     elif args.command == "open-web":
-        open_web()
+        result = open_web()
     elif args.command == "refresh":
-        trigger_cache_refresh()
+        result = trigger_cache_refresh(args.path)
     elif args.command == "tray":
-        run_tray()
+        result = run_tray()
+    elif args.command == "bookmark":
+        mount_path = load_config()["mount_path"]
+        if args.action == "add":
+            result = add_bookmark(mount_path)
+        elif args.action == "remove":
+            result = remove_bookmark(mount_path)
+        else:
+            bm_parser.print_help()
+            result = False
     elif args.command == "service":
         if args.action == "install":
-            install_systemd_service()
+            result = install_systemd_service(start=not args.no_start)
         elif args.action == "remove":
-            remove_systemd_service()
-        elif args.action == "start":
-            subprocess.run(["systemctl", "--user", "start", "google-drive.service"])
-        elif args.action == "stop":
-            subprocess.run(["systemctl", "--user", "stop", "google-drive.service"])
-        elif args.action == "status":
-            subprocess.run(["systemctl", "--user", "status", "google-drive.service"])
+            result = remove_systemd_service()
+        elif args.action in ("start", "stop", "status"):
+            if shutil.which("systemctl"):
+                result = subprocess.run(["systemctl", "--user", args.action, SERVICE_NAME]).returncode == 0
+            else:
+                print("systemctl is not available on this system.", file=sys.stderr)
+                result = False
         else:
             srv_parser.print_help()
-    else:
+            result = False
+    elif len(sys.argv) == 1:
         # Default behavior when launched with no args (e.g. from app launcher or desktop)
-        if len(sys.argv) == 1:
-            open_folder()
-        else:
-            parser.print_help()
+        result = open_folder()
+    else:
+        parser.print_help()
+        result = False
+
+    if result is True:
+        sys.exit(0)
+    sys.exit(result if isinstance(result, int) and not isinstance(result, bool) else 1)
+
 
 if __name__ == "__main__":
     main()

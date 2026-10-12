@@ -38,11 +38,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${HOME}/.local/bin"
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/google-drive-agent"
 DESKTOP_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/applications"
-AUTOSTART_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/autostart"
-SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
 ICON_DIR="${CONFIG_DIR}/icons"
 
-mkdir -p "${BIN_DIR}" "${CONFIG_DIR}" "${ICON_DIR}" "${DESKTOP_DIR}" "${AUTOSTART_DIR}" "${SYSTEMD_USER_DIR}"
+mkdir -p "${BIN_DIR}" "${CONFIG_DIR}" "${ICON_DIR}" "${DESKTOP_DIR}"
 
 # 1. Dependency verification
 log_info "Checking dependencies..."
@@ -66,26 +64,79 @@ if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/nul
 fi
 
 # 2. Check / Install rclone
-if command -v rclone >/dev/null 2>&1; then
-    log_success "rclone is already installed ($(rclone version | head -n1))."
-else
-    log_info "rclone is not found in PATH. Downloading standalone rclone binary..."
-    ARCH="$(uname -m)"
-    case "${ARCH}" in
-        x86_64|amd64) RCLONE_ARCH="linux-amd64" ;;
-        aarch64|arm64) RCLONE_ARCH="linux-arm64" ;;
-        *) log_error "Unsupported architecture: ${ARCH}"; exit 1 ;;
+# Release signing key published at https://rclone.org/install/
+RCLONE_GPG_KEY="FBF737ECE9F8AB18604BD2AC93935E02FF3B54FA"
+
+install_rclone() {
+    local tool arch rclone_arch version zip base tmp_dir gpg_status
+    for tool in curl unzip sha256sum; do
+        if ! command -v "${tool}" >/dev/null 2>&1; then
+            log_error "'${tool}' is required to download rclone. Install it or install rclone from your distro."
+            exit 1
+        fi
+    done
+
+    arch="$(uname -m)"
+    case "${arch}" in
+        x86_64|amd64) rclone_arch="linux-amd64" ;;
+        aarch64|arm64) rclone_arch="linux-arm64" ;;
+        *) log_error "Unsupported architecture: ${arch}"; exit 1 ;;
     esac
 
-    TMP_DIR="$(mktemp -d)"
-    trap 'rm -rf "${TMP_DIR}"' EXIT
+    version="$(curl -fsSL https://downloads.rclone.org/version.txt | awk '{print $2}')"
+    if [[ ! "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "Could not determine the current rclone version."
+        exit 1
+    fi
+    zip="rclone-${version}-${rclone_arch}.zip"
+    base="https://downloads.rclone.org/${version}"
 
-    log_info "Downloading rclone for ${RCLONE_ARCH}..."
-    curl -fsSL "https://downloads.rclone.org/rclone-current-${RCLONE_ARCH}.zip" -o "${TMP_DIR}/rclone.zip"
-    unzip -q -o "${TMP_DIR}/rclone.zip" -d "${TMP_DIR}/extracted"
-    cp "${TMP_DIR}/extracted"/rclone-*-"${RCLONE_ARCH}"/rclone "${BIN_DIR}/rclone"
-    chmod +x "${BIN_DIR}/rclone"
+    tmp_dir="$(mktemp -d)"
+    RCLONE_TMP_DIR="${tmp_dir}"
+    trap 'rm -rf "${RCLONE_TMP_DIR}"' EXIT
+
+    log_info "Downloading rclone ${version} for ${rclone_arch}..."
+    curl -fsSL "${base}/${zip}" -o "${tmp_dir}/${zip}"
+    curl -fsSL "${base}/SHA256SUMS" -o "${tmp_dir}/SHA256SUMS"
+
+    # Verify the checksum list was signed by the rclone release key.
+    if command -v gpg >/dev/null 2>&1; then
+        export GNUPGHOME="${tmp_dir}/gnupg"
+        mkdir -m 700 "${GNUPGHOME}"
+        if gpg --batch --quiet --keyserver hkps://keys.openpgp.org --recv-keys "${RCLONE_GPG_KEY}" >/dev/null 2>&1 \
+            || gpg --batch --quiet --keyserver hkps://keyserver.ubuntu.com --recv-keys "${RCLONE_GPG_KEY}" >/dev/null 2>&1; then
+            gpg_status="$(gpg --batch --status-fd 1 --verify "${tmp_dir}/SHA256SUMS" 2>/dev/null || true)"
+            if ! grep -q "^\[GNUPG:\] VALIDSIG .* ${RCLONE_GPG_KEY}\$" <<<"${gpg_status}"; then
+                log_error "GPG signature verification of rclone SHA256SUMS FAILED. Aborting."
+                exit 1
+            fi
+            log_success "rclone release signature verified."
+        else
+            log_warn "Could not fetch the rclone signing key; verifying SHA-256 checksum only."
+        fi
+        unset GNUPGHOME
+    else
+        log_warn "gpg not found; verifying SHA-256 checksum only."
+    fi
+
+    if ! (cd "${tmp_dir}" && grep -E "^[0-9a-f]{64}  ${zip}\$" SHA256SUMS | sha256sum -c --status -); then
+        log_error "Checksum verification of ${zip} FAILED. Aborting."
+        exit 1
+    fi
+    log_success "rclone checksum verified."
+
+    unzip -q -o "${tmp_dir}/${zip}" -d "${tmp_dir}/extracted"
+    install -m 755 "${tmp_dir}/extracted/rclone-${version}-${rclone_arch}/rclone" "${BIN_DIR}/rclone"
     log_success "Installed rclone to ${BIN_DIR}/rclone."
+}
+
+if command -v rclone >/dev/null 2>&1; then
+    log_success "rclone is already installed ($(rclone version | head -n1))."
+elif [ -x "${BIN_DIR}/rclone" ]; then
+    log_success "rclone is already installed at ${BIN_DIR}/rclone."
+else
+    log_info "rclone is not found in PATH. Downloading standalone rclone binary..."
+    install_rclone
 fi
 
 # 3. Install agent executable
@@ -109,48 +160,31 @@ if [ -f "${SCRIPT_DIR}/assets/google-drive.svg" ]; then
     cp "${SCRIPT_DIR}/assets/google-drive.svg" "${HICOLOR_DIR}/scalable/apps/google-drive.svg"
 fi
 
-# 5. Default configuration
+# 5. Default configuration (may hold an OAuth client secret: keep it private)
+chmod 700 "${CONFIG_DIR}"
 if [ ! -f "${CONFIG_DIR}/config.json" ]; then
     log_info "Creating default configuration..."
-    cp "${SCRIPT_DIR}/config/config.example.json" "${CONFIG_DIR}/config.json"
+    install -m 600 "${SCRIPT_DIR}/config/config.example.json" "${CONFIG_DIR}/config.json"
+else
+    chmod 600 "${CONFIG_DIR}/config.json"
 fi
 
-# 6. Install desktop files
+# 6. Install application launcher
 log_info "Registering desktop integration..."
 sed "s|google-drive-agent|${BIN_DIR}/google-drive-agent|g; s|Icon=google-drive|Icon=${ICON_DIR}/google-drive.png|g" \
     "${SCRIPT_DIR}/desktop/google-drive.desktop" > "${DESKTOP_DIR}/google-drive.desktop"
-
-sed "s|google-drive-agent|${BIN_DIR}/google-drive-agent|g; s|Icon=google-drive|Icon=${ICON_DIR}/google-drive.png|g" \
-    "${SCRIPT_DIR}/desktop/google-drive-agent.desktop" > "${AUTOSTART_DIR}/google-drive-agent.desktop"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "${DESKTOP_DIR}" 2>/dev/null || true
 fi
 
-# 7. Install Systemd user service
-log_info "Setting up systemd user service..."
-cp "${SCRIPT_DIR}/systemd/google-drive.service" "${SYSTEMD_USER_DIR}/google-drive.service"
+# 7. Systemd user service + tray autostart entry (generated by the agent itself)
+log_info "Setting up systemd user service and tray autostart..."
+"${BIN_DIR}/google-drive-agent" service install --no-start || log_warn "Systemd service setup failed; the tray will mount on login instead."
 
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl --user daemon-reload 2>/dev/null || true
-    systemctl --user enable google-drive.service 2>/dev/null || true
-    log_success "Systemd user service enabled."
-fi
-
-# 8. File manager sidebar bookmarks
+# 8. File manager sidebar bookmark (uses mount_path from config.json)
 log_info "Configuring file manager bookmarks..."
-GTK_BM="${XDG_CONFIG_HOME:-${HOME}/.config}/gtk-3.0/bookmarks"
-mkdir -p "$(dirname "${GTK_BM}")"
-if [ -f "${GTK_BM}" ]; then
-    if ! grep -q "GoogleDrive" "${GTK_BM}"; then
-        echo "file://${HOME}/GoogleDrive Google Drive" >> "${GTK_BM}"
-    fi
-else
-    echo "file://${HOME}/GoogleDrive Google Drive" > "${GTK_BM}"
-fi
-
-# Ensure mount directory exists
-mkdir -p "${HOME}/GoogleDrive"
+"${BIN_DIR}/google-drive-agent" bookmark add || true
 
 echo ""
 log_success "Installation completed successfully!"
@@ -158,4 +192,5 @@ echo -e "\n${BOLD}Next Step: Connect your Google Account${RESET}"
 echo -e "Run the setup command in your terminal:\n"
 echo -e "    ${GREEN}${BOLD}google-drive-agent setup${RESET}\n"
 echo -e "Your web browser will open to authenticate. Once approved, Google Drive"
-echo -e "will automatically mount and stream files at ${BOLD}${HOME}/GoogleDrive${RESET}.\n"
+echo -e "will automatically mount and stream files at your configured mount folder"
+echo -e "(default: ${BOLD}${HOME}/GoogleDrive${RESET}).\n"
