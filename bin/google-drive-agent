@@ -65,7 +65,7 @@ DEFAULT_CONFIG = {
     "buffer_size": "16M",
     "drive_chunk_size": "64M",
     "dir_cache_time": "72h",
-    "poll_interval": "15s",
+    "poll_interval": "1m",
     "export_formats": "link.html",
     "log_level": "NOTICE",
     "rc_port": 5572,
@@ -839,6 +839,8 @@ def run_tray():
 
     class GoogleDriveTray:
         QUOTA_INTERVAL = 300
+        # Status is re-checked hourly and after every action; the menu has a manual refresh.
+        STATUS_INTERVAL = 3600
 
         def __init__(self):
             self.lock_fd = lock_fd
@@ -860,7 +862,7 @@ def run_tray():
 
             run_in_background(self._auto_mount)
             self._poll_status()
-            GLib.timeout_add_seconds(5, self._poll_status)
+            GLib.timeout_add_seconds(self.STATUS_INTERVAL, self._poll_status_timer)
 
         def _create_menu(self):
             # Title / Status item
@@ -886,6 +888,11 @@ def run_tray():
             self.menu.append(self.item_web)
 
             self.menu.append(Gtk.SeparatorMenuItem())
+
+            # Manual status check (the tray only polls hourly)
+            self.item_status = Gtk.MenuItem(label="🔃 Check Status Now")
+            self.item_status.connect("activate", lambda _: self._poll_status(force_quota=True))
+            self.menu.append(self.item_status)
 
             # Sync / Refresh
             self.item_refresh = Gtk.MenuItem(label="🔄 Refresh / Sync Now")
@@ -915,12 +922,12 @@ def run_tray():
             cfg = load_config()
             if is_authenticated(cfg["remote_name"]) and not is_mounted(cfg["mount_path"]):
                 mount_drive()
-            GLib.idle_add(self._poll_status)
+            GLib.idle_add(self._poll_status_once)
 
         def _then_poll(self, func):
             def task():
                 func()
-                GLib.idle_add(self._poll_status)
+                GLib.idle_add(self._poll_status_once)
             run_in_background(task)
 
         def _on_toggle_mount(self, _):
@@ -939,12 +946,22 @@ def run_tray():
             else:
                 self._then_poll(setup_auth)
 
-        def _poll_status(self):
+        def _poll_status(self, force_quota=False):
             # Status checks run off the GTK thread so a slow or hung mount can't freeze the UI.
+            if force_quota:
+                self.quota_timestamp = 0
             if not self.polling:
                 self.polling = True
                 run_in_background(self._collect_status)
-            return True
+
+        def _poll_status_timer(self):
+            self._poll_status()
+            return GLib.SOURCE_CONTINUE  # keep the periodic timer alive
+
+        def _poll_status_once(self):
+            # For GLib.idle_add: returning True here would re-run it in a busy loop.
+            self._poll_status()
+            return GLib.SOURCE_REMOVE
 
         def _collect_status(self):
             try:

@@ -10,7 +10,7 @@
   "buffer_size": "16M",
   "drive_chunk_size": "64M",
   "dir_cache_time": "72h",
-  "poll_interval": "15s",
+  "poll_interval": "1m",
   "export_formats": "link.html",
   "log_level": "NOTICE",
   "rc_port": 5572,

@@ -19,7 +19,7 @@
 
 - **Streaming sob Demanda (Cache VFS)**: Acesse todo o seu Google Drive sem lotar o armazenamento do seu computador. Os arquivos são baixados de forma transparente apenas quando você os abre e salvos em cache local.
 - **Sincronização Automática Bidirecional**: Edite ou salve arquivos em qualquer programa local (LibreOffice, VS Code, GIMP, editores de texto) e as alterações sobem para a nuvem em segundo plano automaticamente.
-- **Detecção Rápida de Alterações**: Alterações feitas no navegador ou pelo celular aparecem na sua máquina em menos de 15 segundos.
+- **Detecção Rápida de Alterações**: Alterações feitas no navegador ou pelo celular aparecem na sua máquina em cerca de um minuto.
 - **Suporte a Documentos / Planilhas / Apresentações Google**: Arquivos nativos do Google Workspace são exportados como links web (`.link.html`) que abrem diretamente no seu navegador padrão ao dar duplo clique.
 - **Integração com o Gerenciador de Arquivos**: Adiciona o `Google Drive` automaticamente à barra lateral do seu gerenciador (Nautilus, Dolphin, Thunar e caixas de diálogo Abrir/Salvar).
 - **Bandeja do Sistema (Systray)**: Indicador com status em tempo real, medidor de cota de armazenamento usada/livre, atalhos rápidos e botão para forçar sincronização.
@@ -117,7 +117,7 @@ A configuração fica em `~/.config/google-drive-agent/config.json` (ou em `$XDG
   "buffer_size": "16M",
   "drive_chunk_size": "64M",
   "dir_cache_time": "72h",
-  "poll_interval": "15s",
+  "poll_interval": "1m",
   "export_formats": "link.html",
   "log_level": "NOTICE",
   "rc_port": 5572,

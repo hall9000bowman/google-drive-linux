@@ -19,7 +19,7 @@
 
 - **On-Demand Streaming (VFS Cache)**: Browse your entire Google Drive without filling up your local storage. Files are downloaded transparently when accessed and cached locally.
 - **Bi-Directional Auto-Sync**: Save or edit a file in any local application (LibreOffice, VS Code, GIMP, text editors) and changes automatically upload to the cloud in the background.
-- **Fast Change Polling**: Remote changes made on web or mobile appear on your desktop within 15 seconds.
+- **Fast Change Polling**: Remote changes made on web or mobile appear on your desktop within about a minute.
 - **Google Docs / Sheets / Slides Support**: Native Google Workspace files are exported as web links that open directly in your default browser on double-click.
 - **File Manager Integration**: Automatically bookmarks `Google Drive` in your file manager's sidebar (Nautilus, Dolphin, Thunar, and file dialogs).
 - **System Tray Applet**: Real-time status indicator, storage quota display, quick links to open your Drive folder or the web interface, and manual refresh controls.
@@ -117,7 +117,7 @@ The agent configuration is stored in `~/.config/google-drive-agent/config.json` 
   "buffer_size": "16M",
   "drive_chunk_size": "64M",
   "dir_cache_time": "72h",
-  "poll_interval": "15s",
+  "poll_interval": "1m",
   "export_formats": "link.html",
   "log_level": "NOTICE",
   "rc_port": 5572,
